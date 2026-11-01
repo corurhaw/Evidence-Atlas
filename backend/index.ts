@@ -32,7 +32,11 @@ type AtlasRecord = {
 };
 
 const tableOf = (userId: string) =>
-  'atlas_' + userId.replace(/[^A-Za-z0-9]/g, '');
+  'atlas_' +
+  userId.replace(
+    /[^A-Za-z0-9]/g,
+    ch => '_' + ch.charCodeAt(0).toString(16) + '_'
+  );
 const str = (value: unknown, max = 2000) =>
   typeof value === 'string' ? value.trim().slice(0, max) : '';
 const kinds: Kind[] = ['source', 'claim', 'hypothesis', 'edge'];
@@ -58,7 +62,11 @@ function normalize(body: unknown, existing?: AtlasRecord): AtlasRecord | null {
   const kind = (existing?.kind || input.kind) as Kind;
   if (!kinds.includes(kind)) return null;
   const title = str(input.title, 240);
-  if (!title || (kind === 'edge' && !str(input.from, 80))) return null;
+  if (
+    !title ||
+    (kind === 'edge' && (!str(input.from, 80) || !str(input.to, 80)))
+  )
+    return null;
   const url = str(input.url, 1000);
   if (url && !/^https:\/\//i.test(url)) return null;
   const relation = relations.includes(str(input.relation))
@@ -104,6 +112,21 @@ async function checkEdge(table: string, record: AtlasRecord) {
     consistent: true,
   });
   return Boolean(a && b && a.kind !== 'edge' && b.kind !== 'edge');
+}
+
+async function listAllRecords(table: string): Promise<AtlasRecord[]> {
+  const all: AtlasRecord[] = [];
+  let cursor: string | undefined = undefined;
+  for (let page = 0; page < 50; page++) {
+    const data = await db.list<AtlasRecord>(table, {
+      limit: 250,
+      ...(cursor ? { nextToken: cursor } : {}),
+    });
+    all.push(...data.items);
+    if (!data.nextToken) break;
+    cursor = data.nextToken;
+  }
+  return all;
 }
 
 function backendFailure(err: unknown) {
@@ -249,13 +272,14 @@ export const handler = router({
           }
         }
         try {
-          const linked = await db.list<AtlasRecord>(table, { limit: 250 });
-          const ids = linked.items
+          const allRecords = await listAllRecords(table);
+          const ids = allRecords
             .filter(
               item =>
                 item.kind === 'edge' && (item.from === id || item.to === id)
             )
-            .map(item => item.id);
+            .map(item => item.id)
+            .filter((edgeId): edgeId is string => Boolean(edgeId));
           if (ids.length) await db.delete(table, ids);
         } catch (err) {
           console.warn('Edge cleanup pending', err);
@@ -286,12 +310,38 @@ export const handler = router({
         }
         if (str(body.contentType) !== 'application/pdf')
           return error('Only PDF files are supported.', 400);
+        const table = tableOf(ctx.user!.userId);
+        const [existing] = await db.get<AtlasRecord>(table, [id], {
+          consistent: true,
+        });
+        if (existing)
+          return error('Attachment ID is already in use.', 409);
         const path = ctx.user!.userId + '/' + id + '.pdf';
         const [ok] = await storage.write([
           { path, content, contentType: 'application/pdf' },
         ]);
         if (!ok) return error('Upload failed.', 500);
         return json({ filePath: path });
+      } catch (err) {
+        return backendFailure(err);
+      }
+    },
+  ],
+  'DELETE /api/files/:id': [
+    requireAuth(),
+    async ctx => {
+      try {
+        const id = ctx.params.id;
+        if (!isId(id)) return error('Invalid attachment ID.', 400);
+        const table = tableOf(ctx.user!.userId);
+        const [existing] = await db.get<AtlasRecord>(table, [id], {
+          consistent: true,
+        });
+        if (existing)
+          return error('Delete the parent record to remove its attachment.', 409);
+        const path = ctx.user!.userId + '/' + id + '.pdf';
+        await storage.delete([path]);
+        return json({ deleted: true });
       } catch (err) {
         return backendFailure(err);
       }

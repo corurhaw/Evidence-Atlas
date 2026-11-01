@@ -113,7 +113,12 @@ const shortDate = (date?: string) =>
       })
     : '—';
 function escapeCsv(value: unknown) {
-  return '"' + String(value ?? '').replace(/"/g, '""') + '"';
+  const raw = String(value ?? '');
+  const safe =
+    /^[=+\-@\t\r]/.test(raw) && !/^-\d+(\.\d+)?$/.test(raw)
+      ? "'" + raw
+      : raw;
+  return '"' + safe.replace(/"/g, '""') + '"';
 }
 function downloadFile(filename: string, content: string, type: string) {
   const objectUrl = URL.createObjectURL(new Blob([content], { type }));
@@ -442,9 +447,17 @@ export default function AtlasApp() {
         filePath = uploaded.data.filePath;
       }
       const body = { ...form, title: form.title.trim(), filePath, id };
-      const result = editing
-        ? await api.put('/api/records/' + id, body)
-        : await api.post('/api/records', body);
+      let result;
+      try {
+        result = editing
+          ? await api.put('/api/records/' + id, body)
+          : await api.post('/api/records', body);
+      } catch (recordErr) {
+        if (file && !editing && filePath) {
+          await api.delete('/api/files/' + id).catch(() => {});
+        }
+        throw recordErr;
+      }
       const saved = result.data.record as RecordItem;
       setRecords(previous => [
         saved,
